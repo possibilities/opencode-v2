@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Schema } from "effect"
+import { DateTime, Schema } from "effect"
 import { Agent } from "../src/agent"
 import { FileSystem } from "../src/filesystem"
 import { Model } from "../src/model"
@@ -8,6 +8,7 @@ import { Pty } from "../src/pty"
 import { Question } from "../src/question"
 import { Session } from "../src/session"
 import { SessionEvent } from "../src/session-event"
+import { SessionMessage } from "../src/session-message"
 import { SessionTodo } from "../src/session-todo"
 import { optional } from "../src/schema"
 
@@ -17,6 +18,35 @@ describe("contract hygiene", () => {
     expect(Schema.decodeUnknownSync(Value)({ value: "1" })).toEqual({ value: 1 })
     expect(Schema.encodeSync(Value)({ value: 1 })).toEqual({ value: "1" })
     expect(Schema.encodeSync(Value)({ value: undefined })).toEqual({})
+  })
+
+  test("work and text correlation stays optional in historical payloads", () => {
+    const text = Schema.encodeSync(SessionEvent.Text.Ended.data)(
+      SessionEvent.Text.Ended.data.make({
+        sessionID: Session.ID.make("ses_history"),
+        timestamp: DateTime.makeUnsafe(0),
+        assistantMessageID: SessionMessage.ID.create(),
+        textID: "item_provider",
+        text: "Done",
+        workID: undefined,
+        inputMessageIDs: undefined,
+        providerMetadata: undefined,
+      }),
+    )
+    expect(text).not.toHaveProperty("workID")
+    expect(text).not.toHaveProperty("inputMessageIDs")
+    expect(text).not.toHaveProperty("providerMetadata")
+    const settled = Schema.encodeSync(SessionEvent.Work.Settled.data)(
+      SessionEvent.Work.Settled.data.make({
+        sessionID: Session.ID.make("ses_history"),
+        timestamp: DateTime.makeUnsafe(0),
+        workID: "work_test",
+        inputMessageIDs: [],
+        outcome: "completed",
+        error: undefined,
+      }),
+    )
+    expect(settled).not.toHaveProperty("error")
   })
 
   test("todo status and priority preserve arbitrary strings", () => {

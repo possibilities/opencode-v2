@@ -32,6 +32,7 @@ import { LocationServiceMap } from "./location-service-map"
 import { MessageDecodeError } from "./session/error"
 import { SessionEvent } from "./session/event"
 import { SessionInput } from "./session/input"
+import { SessionWorkControl } from "./session/work-control"
 import { Snapshot } from "./snapshot"
 import { SessionRevert } from "./session/revert"
 import { Revert } from "@opencode-ai/schema/revert"
@@ -150,7 +151,8 @@ export interface Interface {
     prompt: PromptInput.Prompt
     delivery?: SessionInput.Delivery
     resume?: boolean
-  }) => Effect.Effect<SessionInput.Admitted, NotFoundError | PromptConflictError>
+    expectedWorkID?: string
+  }) => Effect.Effect<SessionInput.Admitted, NotFoundError | PromptConflictError | SessionWorkControl.ChangedError>
   readonly shell: (input: {
     id?: EventV2.ID
     sessionID: SessionSchema.ID
@@ -167,7 +169,10 @@ export interface Interface {
   readonly wait: (id: SessionSchema.ID) => Effect.Effect<void, NotFoundError | OperationUnavailableError>
   readonly active: Effect.Effect<ReadonlySet<SessionSchema.ID>>
   readonly resume: (sessionID: SessionSchema.ID) => Effect.Effect<void, NotFoundError | SessionRunner.RunError>
-  readonly interrupt: (sessionID: SessionSchema.ID) => Effect.Effect<void>
+  readonly interrupt: (
+    sessionID: SessionSchema.ID,
+    expectedWorkID?: string,
+  ) => Effect.Effect<void, SessionWorkControl.ChangedError>
   readonly revert: {
     readonly stage: (input: {
       sessionID: SessionSchema.ID
@@ -189,6 +194,7 @@ const layer = Layer.effect(
     const events = yield* EventV2.Service
     const projects = yield* ProjectV2.Service
     const execution = yield* SessionExecution.Service
+    const workControl = yield* SessionWorkControl.Service
     const store = yield* SessionStore.Service
     const locations = yield* LocationServiceMap.Service
     const decodeMessage = Schema.decodeUnknownEffect(SessionMessage.Message)
@@ -358,31 +364,80 @@ const layer = Layer.effect(
         })
       }),
       prompt: Effect.fn("V2Session.prompt")((input) =>
-        Effect.uninterruptible(
-          Effect.gen(function* () {
-            yield* result.get(input.sessionID)
-            const prompt = resolvePrompt(input.prompt)
-            const messageID = input.id ?? SessionMessage.ID.create()
-            const delivery = input.delivery ?? "steer"
-            const expected = { sessionID: input.sessionID, messageID, prompt, delivery }
-            const admitted = yield* SessionInput.admit(db, events, {
-              id: messageID,
-              sessionID: input.sessionID,
-              prompt,
-              delivery,
+        input.expectedWorkID !== undefined
+          ? Effect.gen(function* () {
+              yield* result.get(input.sessionID)
+              const guarded = {
+                id: input.id ?? SessionMessage.ID.create(),
+                sessionID: input.sessionID,
+                prompt: resolvePrompt(input.prompt),
+                workID: input.expectedWorkID!,
+              }
+              if (input.delivery === "queue" || input.resume === false)
+                return yield* new SessionWorkControl.ChangedError({
+                  sessionID: input.sessionID,
+                  workID: guarded.workID,
+                })
+              const retry = yield* SessionInput.guardedRetry(db, guarded)
+              if (retry) return retry
+              return yield* workControl
+                .submit({
+                  sessionID: guarded.sessionID,
+                  workID: guarded.workID,
+                  id: guarded.id,
+                  fingerprint: JSON.stringify(Schema.encodeSync(Prompt)(guarded.prompt)),
+                  commit: (work) =>
+                    Effect.gen(function* () {
+                      const retry = yield* SessionInput.guardedRetry(db, guarded)
+                      if (retry) return retry
+                      if (work.inputs.size >= SessionInput.MAX_WORK_INPUTS)
+                        return yield* new SessionWorkControl.ChangedError({
+                          sessionID: guarded.sessionID,
+                          workID: guarded.workID,
+                        })
+                      return yield* SessionInput.admitGuarded(db, events, guarded, work)
+                    }),
+                })
+                .pipe(
+                  Effect.catchTag("Session.WorkChangedError", (error) =>
+                    SessionInput.guardedRetry(db, guarded).pipe(
+                      Effect.flatMap((retry) => (retry ? Effect.succeed(retry) : error)),
+                    ),
+                  ),
+                )
             }).pipe(
+              Effect.interruptible,
               Effect.catchDefect((defect) =>
                 defect instanceof SessionInput.LifecycleConflict
-                  ? new PromptConflictError({ sessionID: input.sessionID, messageID })
+                  ? new PromptConflictError({ sessionID: input.sessionID, messageID: defect.id })
                   : Effect.die(defect),
               ),
             )
-            if (!SessionInput.equivalent(admitted, expected))
-              return yield* new PromptConflictError({ sessionID: input.sessionID, messageID })
-            if (input.resume !== false) yield* execution.wake(admitted.sessionID)
-            return admitted
-          }),
-        ),
+          : Effect.uninterruptible(
+              Effect.gen(function* () {
+                yield* result.get(input.sessionID)
+                const prompt = resolvePrompt(input.prompt)
+                const messageID = input.id ?? SessionMessage.ID.create()
+                const delivery = input.delivery ?? "steer"
+                const expected = { sessionID: input.sessionID, messageID, prompt, delivery }
+                const admitted = yield* SessionInput.admit(db, events, {
+                  id: messageID,
+                  sessionID: input.sessionID,
+                  prompt,
+                  delivery,
+                }).pipe(
+                  Effect.catchDefect((defect) =>
+                    defect instanceof SessionInput.LifecycleConflict
+                      ? new PromptConflictError({ sessionID: input.sessionID, messageID })
+                      : Effect.die(defect),
+                  ),
+                )
+                if (!SessionInput.equivalent(admitted, expected))
+                  return yield* new PromptConflictError({ sessionID: input.sessionID, messageID })
+                if (input.resume !== false) yield* execution.wake(admitted.sessionID)
+                return admitted
+              }),
+            ),
       ),
       shell: Effect.fn("V2Session.shell")(function* () {
         return yield* new OperationUnavailableError({ operation: "shell" })
@@ -427,8 +482,12 @@ const layer = Layer.effect(
         yield* result.get(sessionID)
         yield* execution.resume(sessionID)
       }),
-      interrupt: Effect.fn("V2Session.interrupt")((sessionID) =>
-        Effect.uninterruptible(execution.interrupt(sessionID)),
+      interrupt: Effect.fn("V2Session.interrupt")((sessionID, expectedWorkID) =>
+        Effect.uninterruptible(
+          expectedWorkID === undefined
+            ? execution.interrupt(sessionID)
+            : workControl.interrupt(sessionID, expectedWorkID),
+        ),
       ),
       revert: {
         stage: Effect.fn("V2Session.revert.stage")(function* (input) {
@@ -479,6 +538,7 @@ export const node = makeGlobalNode({
     EventV2.node,
     ProjectV2.node,
     SessionExecution.node,
+    SessionWorkControl.node,
     SessionStore.node,
     LocationServiceMap.node,
     SessionProjector.node,

@@ -5,6 +5,7 @@ import { DateTime, Effect, Schema } from "effect"
 import { Admitted, Delivery } from "@opencode-ai/schema/session-input"
 import type { Database } from "../database/database"
 import type { EventV2 } from "../event"
+import { EventTable } from "../event/sql"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
 import { Prompt } from "./prompt"
@@ -37,6 +38,68 @@ export const find = Effect.fn("SessionInput.find")(function* (db: DatabaseServic
 export class LifecycleConflict extends Schema.TaggedErrorClass<LifecycleConflict>()("SessionInput.LifecycleConflict", {
   id: SessionMessage.ID,
 }) {}
+
+/** Reconcile a fenced retry from its durable promotion, even after the owning work has settled. */
+export const guardedRetry = Effect.fn("SessionInput.guardedRetry")(function* (
+  db: DatabaseService,
+  input: {
+    readonly id: SessionMessage.ID
+    readonly sessionID: SessionSchema.ID
+    readonly prompt: Prompt
+    readonly workID: string
+  },
+) {
+  const stored = yield* find(db, input.id)
+  if (!stored) return
+  if (!equivalent(stored, { ...input, delivery: "steer" }) || stored.promotedSeq === undefined)
+    return yield* Effect.die(new LifecycleConflict({ id: input.id }))
+  const event = yield* db
+    .select()
+    .from(EventTable)
+    .where(and(eq(EventTable.aggregate_id, input.sessionID), eq(EventTable.seq, stored.promotedSeq)))
+    .get()
+    .pipe(Effect.orDie)
+  if (
+    event?.type !== `${SessionEvent.Prompted.type}.${SessionEvent.Prompted.durable?.version}` ||
+    event.data.workID !== input.workID ||
+    event.data.messageID !== input.id
+  )
+    return yield* Effect.die(new LifecycleConflict({ id: input.id }))
+  return stored
+})
+
+/** One Prompted transaction atomically admits and promotes a guarded steer at its owner's safe boundary. */
+export const admitGuarded = Effect.fn("SessionInput.admitGuarded")(function* (
+  db: DatabaseService,
+  events: EventV2.Interface,
+  input: { readonly id: SessionMessage.ID; readonly sessionID: SessionSchema.ID; readonly prompt: Prompt },
+  work: Work,
+) {
+  yield* events.publish(
+    SessionEvent.Prompted,
+    {
+      sessionID: input.sessionID,
+      timestamp: yield* DateTime.now,
+      messageID: input.id,
+      prompt: input.prompt,
+      delivery: "steer",
+      workID: work.id,
+    },
+    {
+      commit: (seq) =>
+        Effect.gen(function* () {
+          const stored = yield* find(db, input.id)
+          // A competing ordinary admission of this ID must roll back the whole guarded transaction.
+          if (stored?.admittedSeq !== seq || stored.promotedSeq !== seq)
+            return yield* Effect.die(new LifecycleConflict({ id: input.id }))
+        }),
+    },
+  )
+  work.inputs.add(input.id)
+  const stored = yield* find(db, input.id)
+  if (!stored) return yield* Effect.die("Guarded prompt was not projected")
+  return stored
+})
 
 export const admit = Effect.fn("SessionInput.admit")(function* (
   db: DatabaseService,
@@ -188,6 +251,59 @@ export const hasPending = Effect.fn("SessionInput.hasPending")(function* (
   return row !== undefined
 })
 
+/** Process-local membership of one durable work; never inferred from an admission watermark. */
+export type Work = {
+  readonly id: string
+  readonly inputs: Set<SessionMessage.ID>
+  readonly pending?: Set<SessionMessage.ID>
+}
+export const MAX_WORK_INPUTS = 1024
+
+/** Snapshot the exact inputs selected for the next safe boundary before initialization can fail. */
+export const selected = Effect.fn("SessionInput.selected")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+  delivery: Delivery,
+  cutoff: number,
+  limit: number,
+) {
+  if (limit <= 0) return []
+  const queued =
+    delivery === "queue"
+      ? yield* db
+          .select({ id: SessionInputTable.id })
+          .from(SessionInputTable)
+          .where(
+            and(
+              eq(SessionInputTable.session_id, sessionID),
+              isNull(SessionInputTable.promoted_seq),
+              eq(SessionInputTable.delivery, "queue"),
+              lte(SessionInputTable.admitted_seq, cutoff),
+            ),
+          )
+          .orderBy(asc(SessionInputTable.admitted_seq))
+          .limit(1)
+          .get()
+          .pipe(Effect.orDie)
+      : undefined
+  const steers = yield* db
+    .select({ id: SessionInputTable.id })
+    .from(SessionInputTable)
+    .where(
+      and(
+        eq(SessionInputTable.session_id, sessionID),
+        isNull(SessionInputTable.promoted_seq),
+        eq(SessionInputTable.delivery, "steer"),
+        lte(SessionInputTable.admitted_seq, cutoff),
+      ),
+    )
+    .orderBy(asc(SessionInputTable.admitted_seq))
+    .limit(limit - Number(queued !== undefined))
+    .all()
+    .pipe(Effect.orDie)
+  return [...(queued ? [queued] : []), ...steers].map((row) => SessionMessage.ID.make(row.id))
+})
+
 export const equivalent = (
   input: Admitted,
   expected: {
@@ -218,6 +334,7 @@ const publish = Effect.fn("SessionInput.publish")(function* (
   events: EventV2.Interface,
   sessionID: SessionSchema.ID,
   rows: ReadonlyArray<typeof SessionInputTable.$inferSelect>,
+  work?: Work,
 ) {
   for (const row of rows) {
     const id = SessionMessage.ID.make(row.id)
@@ -228,8 +345,15 @@ const publish = Effect.fn("SessionInput.publish")(function* (
         messageID: id,
         prompt: decodePrompt(row.prompt),
         delivery: row.delivery,
+        workID: work?.id,
       })
       .pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            work?.inputs.add(id)
+            work?.pending?.delete(id)
+          }),
+        ),
         Effect.catchDefect((defect) =>
           defect instanceof LifecycleConflict
             ? find(db, id).pipe(
@@ -237,6 +361,7 @@ const publish = Effect.fn("SessionInput.publish")(function* (
               )
             : Effect.die(defect),
         ),
+        Effect.uninterruptible,
       )
   }
   return rows.length
@@ -247,6 +372,7 @@ export const promoteSteers = Effect.fn("SessionInput.promoteSteers")(function* (
   events: EventV2.Interface,
   sessionID: SessionSchema.ID,
   cutoff: number,
+  work?: Work,
 ) {
   const rows = yield* db
     .select()
@@ -260,15 +386,17 @@ export const promoteSteers = Effect.fn("SessionInput.promoteSteers")(function* (
       ),
     )
     .orderBy(asc(SessionInputTable.admitted_seq))
+    .limit(work ? Math.max(0, MAX_WORK_INPUTS - work.inputs.size) : Number.MAX_SAFE_INTEGER)
     .all()
     .pipe(Effect.orDie)
-  return yield* publish(db, events, sessionID, rows)
+  return yield* publish(db, events, sessionID, rows, work)
 })
 
 export const promoteNextQueued = Effect.fn("SessionInput.promoteNextQueued")(function* (
   db: DatabaseService,
   events: EventV2.Interface,
   sessionID: SessionSchema.ID,
+  work?: Work,
 ) {
   const row = yield* db
     .select()
@@ -284,5 +412,5 @@ export const promoteNextQueued = Effect.fn("SessionInput.promoteNextQueued")(fun
     .limit(1)
     .get()
     .pipe(Effect.orDie)
-  return row === undefined ? false : yield* publish(db, events, sessionID, [row]).pipe(Effect.as(true))
+  return row === undefined ? false : yield* publish(db, events, sessionID, [row], work).pipe(Effect.as(true))
 })

@@ -44,6 +44,7 @@ export const ModelSwitched = Schema.Struct({
 export interface User extends Schema.Schema.Type<typeof User> {}
 export const User = Schema.Struct({
   ...Base,
+  workID: Schema.String.pipe(optional),
   text: Prompt.fields.text,
   files: Prompt.fields.files,
   agents: Prompt.fields.agents,
@@ -142,6 +143,7 @@ export const AssistantText = Schema.Struct({
   type: Schema.Literal("text"),
   id: Schema.String,
   text: Schema.String,
+  providerMetadata: ProviderMetadata.pipe(optional),
 }).annotate({ identifier: "Session.Message.Assistant.Text" })
 
 export interface AssistantReasoning extends Schema.Schema.Type<typeof AssistantReasoning> {}
@@ -165,6 +167,8 @@ export interface Assistant extends Schema.Schema.Type<typeof Assistant> {}
 export const Assistant = Schema.Struct({
   ...Base,
   type: Schema.Literal("assistant"),
+  workID: Schema.String.pipe(optional),
+  inputMessageIDs: Schema.Array(ID).pipe(optional),
   agent: Schema.String,
   model: Model.Ref,
   content: AssistantContent.pipe(Schema.Array),

@@ -17,6 +17,10 @@ import type {
   SessionsSwitchModelOutput,
   SessionsPromptInput,
   SessionsPromptOutput,
+  SessionsWorkPromptInput,
+  SessionsWorkPromptOutput,
+  SessionsWorkInterruptInput,
+  SessionsWorkInterruptOutput,
   SessionsCompactInput,
   SessionsCompactOutput,
   SessionsWaitInput,
@@ -379,6 +383,29 @@ export function make(options: ClientOptions) {
           },
           requestOptions,
         ).then((value) => value.data),
+      workPrompt: (input: SessionsWorkPromptInput, requestOptions?: RequestOptions) =>
+        request<{ readonly data: SessionsWorkPromptOutput }>(
+          {
+            method: "POST",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/work/${encodeURIComponent(input.workID)}/prompt`,
+            body: { id: input["id"], prompt: input["prompt"] },
+            successStatus: 200,
+            declaredStatuses: [409, 404, 400, 401],
+            empty: false,
+          },
+          requestOptions,
+        ).then((value) => value.data),
+      workInterrupt: (input: SessionsWorkInterruptInput, requestOptions?: RequestOptions) =>
+        request<SessionsWorkInterruptOutput>(
+          {
+            method: "POST",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/work/${encodeURIComponent(input.workID)}/interrupt`,
+            successStatus: 204,
+            declaredStatuses: [409, 400, 404, 401],
+            empty: true,
+          },
+          requestOptions,
+        ),
       compact: (input: SessionsCompactInput, requestOptions?: RequestOptions) =>
         request<SessionsCompactOutput>(
           {
@@ -746,9 +773,9 @@ export function make(options: ClientOptions) {
           {
             method: "POST",
             path: `/api/session/${encodeURIComponent(input.sessionID)}/permission/${encodeURIComponent(input.requestID)}/reply`,
-            body: { reply: input["reply"], message: input["message"] },
+            body: { reply: input["reply"], message: input["message"], expectedRequest: input["expectedRequest"] },
             successStatus: 204,
-            declaredStatuses: [404, 400, 401],
+            declaredStatuses: [404, 409, 400, 401],
             empty: true,
           },
           requestOptions,

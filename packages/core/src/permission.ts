@@ -1,7 +1,8 @@
 export * as PermissionV2 from "./permission"
 
+import { isDeepStrictEqual } from "node:util"
 import { makeLocationNode } from "./effect/app-node"
-import { Context, Deferred, Effect as EffectRuntime, Layer, Schema } from "effect"
+import { Context, Deferred, Effect as EffectRuntime, Layer, Schema, Semaphore } from "effect"
 import { Permission } from "@opencode-ai/schema/permission"
 import { EventV2 } from "./event"
 import { Location } from "./location"
@@ -46,6 +47,7 @@ export const ReplyInput = Schema.Struct({
   requestID: ID,
   reply: Reply,
   message: Schema.String.pipe(Schema.optional),
+  expectedRequest: Request.pipe(Schema.optional),
 }).annotate({ identifier: "PermissionV2.ReplyInput" })
 export type ReplyInput = typeof ReplyInput.Type
 
@@ -71,6 +73,15 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Per
   requestID: ID,
 }) {}
 
+export class RequestChangedError extends Schema.TaggedErrorClass<RequestChangedError>()(
+  "PermissionV2.RequestChangedError",
+  {
+    requestID: ID,
+  },
+) {}
+
+const encodeRequest = Schema.encodeSync(Request)
+
 export type Error = BlockedError | CorrectedError
 
 export function evaluate(action: string, resource: string, ...rulesets: Permission.Ruleset[]): Permission.Rule {
@@ -92,7 +103,7 @@ export function merge(...rulesets: Permission.Ruleset[]): Permission.Ruleset {
 export interface Interface {
   readonly ask: (input: AssertInput) => EffectRuntime.Effect<AskResult, SessionV2.NotFoundError>
   readonly assert: (input: AssertInput) => EffectRuntime.Effect<void, Error | SessionV2.NotFoundError>
-  readonly reply: (input: ReplyInput) => EffectRuntime.Effect<void, NotFoundError>
+  readonly reply: (input: ReplyInput) => EffectRuntime.Effect<void, NotFoundError | RequestChangedError>
   readonly get: (id: ID) => EffectRuntime.Effect<Request | undefined>
   readonly forSession: (sessionID: SessionV2.ID) => EffectRuntime.Effect<ReadonlyArray<Request>>
   readonly list: () => EffectRuntime.Effect<ReadonlyArray<Request>>
@@ -115,6 +126,7 @@ const layer = Layer.effect(
     const sessions = yield* SessionStore.Service
     const saved = yield* PermissionSaved.Service
     const pending = new Map<ID, Pending>()
+    const withReply = Semaphore.makeUnsafe(1).withPermit
 
     yield* EffectRuntime.addFinalizer(() =>
       EffectRuntime.forEach(pending.values(), (item) => Deferred.fail(item.deferred, new DeclinedError()), {
@@ -164,6 +176,7 @@ const layer = Layer.effect(
     function request(input: AssertInput): Request {
       return {
         id: input.id ?? ID.create(),
+        generation: crypto.randomUUID(),
         sessionID: input.sessionID,
         action: input.action,
         resources: input.resources,
@@ -180,9 +193,13 @@ const layer = Layer.effect(
           const item = { request, agent, deferred }
           if (pending.has(request.id)) return yield* EffectRuntime.die(`Duplicate pending permission ID: ${request.id}`)
           pending.set(request.id, item)
-          yield* events
-            .publish(Event.Asked, request)
-            .pipe(EffectRuntime.onError(() => EffectRuntime.sync(() => pending.delete(request.id))))
+          yield* events.publish(Event.Asked, request).pipe(
+            EffectRuntime.onError(() =>
+              EffectRuntime.sync(() => {
+                if (pending.get(request.id) === item) pending.delete(request.id)
+              }),
+            ),
+          )
           return item
         }),
       )
@@ -209,8 +226,8 @@ const layer = Layer.effect(
             EffectRuntime.catchTag("PermissionV2.DeclinedError", (error) => EffectRuntime.die(error)),
             EffectRuntime.ensuring(
               EffectRuntime.sync(() => {
-                pending.delete(item.request.id)
-              }),
+                if (pending.get(item.request.id) === item) pending.delete(item.request.id)
+              }).pipe(withReply),
             ),
           )
         }),
@@ -222,6 +239,11 @@ const layer = Layer.effect(
         EffectRuntime.gen(function* () {
           const existing = pending.get(input.requestID)
           if (!existing) return yield* new NotFoundError({ requestID: input.requestID })
+          if (
+            input.expectedRequest !== undefined &&
+            !isDeepStrictEqual(encodeRequest(input.expectedRequest), encodeRequest(existing.request))
+          )
+            return yield* new RequestChangedError({ requestID: input.requestID })
           yield* events.publish(Event.Replied, {
             sessionID: existing.request.sessionID,
             requestID: existing.request.id,
@@ -233,7 +255,7 @@ const layer = Layer.effect(
               existing.deferred,
               input.message ? new CorrectedError({ feedback: input.message }) : new DeclinedError(),
             )
-            pending.delete(input.requestID)
+            if (pending.get(input.requestID) === existing) pending.delete(input.requestID)
             for (const [id, item] of pending) {
               if (item.request.sessionID !== existing.request.sessionID) continue
               yield* events.publish(Event.Replied, {
@@ -255,7 +277,7 @@ const layer = Layer.effect(
             })
           }
           yield* Deferred.succeed(existing.deferred, undefined)
-          pending.delete(input.requestID)
+          if (pending.get(input.requestID) === existing) pending.delete(input.requestID)
           if (input.reply !== "always" || !existing.request.save?.length) return
 
           const rememberedRules = yield* savedRules()
@@ -282,7 +304,7 @@ const layer = Layer.effect(
             pending.delete(id)
           }
         }),
-      ),
+      ).pipe(withReply),
     )
 
     const list = EffectRuntime.fn("PermissionV2.list")(function* () {

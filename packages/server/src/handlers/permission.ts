@@ -4,7 +4,7 @@ import { PermissionSaved } from "@opencode-ai/core/permission/saved"
 import { Effect } from "effect"
 import { HttpApiBuilder, HttpApiSchema } from "effect/unstable/httpapi"
 import { Api } from "../api"
-import { PermissionNotFoundError, SessionNotFoundError } from "@opencode-ai/protocol/errors"
+import { ConflictError, PermissionNotFoundError, SessionNotFoundError } from "@opencode-ai/protocol/errors"
 import { response } from "../location"
 
 function missingRequest(id: PermissionV2.ID) {
@@ -71,8 +71,23 @@ export const PermissionHandler = HttpApiBuilder.group(Api, "server.permission", 
           const request = yield* permission.get(ctx.params.requestID)
           if (!request || request.sessionID !== ctx.params.sessionID) return yield* missingRequest(ctx.params.requestID)
           yield* permission
-            .reply({ requestID: ctx.params.requestID, reply: ctx.payload.reply, message: ctx.payload.message })
-            .pipe(Effect.catchTag("PermissionV2.NotFoundError", () => missingRequest(ctx.params.requestID)))
+            .reply({
+              requestID: ctx.params.requestID,
+              reply: ctx.payload.reply,
+              message: ctx.payload.message,
+              expectedRequest: ctx.payload.expectedRequest ?? request,
+            })
+            .pipe(
+              Effect.catchTag("PermissionV2.NotFoundError", () => missingRequest(ctx.params.requestID)),
+              Effect.catchTag(
+                "PermissionV2.RequestChangedError",
+                () =>
+                  new ConflictError({
+                    resource: ctx.params.requestID,
+                    message: "Permission request changed; review the current request before replying",
+                  }),
+              ),
+            )
           return HttpApiSchema.NoContent.make()
         }),
       )

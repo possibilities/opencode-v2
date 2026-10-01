@@ -581,4 +581,25 @@ describe("SessionV2.prompt", () => {
       expect(wakeCalls).toEqual([])
     }),
   )
+  it.effect("bounds exact work membership without losing remaining admitted inputs", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      const db = (yield* Database.Service).db
+      const first = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
+      const second = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
+      const work: SessionInput.Work = {
+        id: "work_bound",
+        inputs: new Set(Array.from({ length: SessionInput.MAX_WORK_INPUTS - 1 }, () => SessionMessage.ID.create())),
+      }
+      expect(yield* SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER, work)).toBe(1)
+      expect(work.inputs.size).toBe(SessionInput.MAX_WORK_INPUTS)
+      expect(work.inputs.has(first.id)).toBe(true)
+      expect(work.inputs.has(second.id)).toBe(false)
+      expect(yield* SessionInput.hasPending(db, sessionID, "steer")).toBe(true)
+      expect(yield* SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER, work)).toBe(0)
+      expect((yield* SessionInput.find(db, second.id))?.promotedSeq).toBeUndefined()
+    }),
+  )
 })

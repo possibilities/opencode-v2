@@ -101,7 +101,11 @@ export type ProjectCopyError = {
 export const isProjectCopyError = (value: unknown): value is ProjectCopyError =>
   typeof value === "object" && value !== null && "name" in value && value["name"] === "ProjectCopyError"
 
-export type HealthGetOutput = { readonly healthy: true }
+export type HealthGetOutput = {
+  readonly healthy: true
+  readonly sessionWorkProtocolVersion: 1
+  readonly sessionWorkControlProtocolVersion: 1
+}
 
 export type LocationGetInput = {
   readonly location?: {
@@ -482,6 +486,75 @@ export type SessionsPromptOutput = {
   }
 }["data"]
 
+export type SessionsWorkPromptInput = {
+  readonly sessionID: { readonly sessionID: string; readonly workID: string }["sessionID"]
+  readonly workID: { readonly sessionID: string; readonly workID: string }["workID"]
+  readonly id: {
+    readonly id: string
+    readonly prompt: {
+      readonly text: string
+      readonly files?: ReadonlyArray<{
+        readonly uri: string
+        readonly name?: string
+        readonly description?: string
+        readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+      }>
+      readonly agents?: ReadonlyArray<{
+        readonly name: string
+        readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+      }>
+    }
+  }["id"]
+  readonly prompt: {
+    readonly id: string
+    readonly prompt: {
+      readonly text: string
+      readonly files?: ReadonlyArray<{
+        readonly uri: string
+        readonly name?: string
+        readonly description?: string
+        readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+      }>
+      readonly agents?: ReadonlyArray<{
+        readonly name: string
+        readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+      }>
+    }
+  }["prompt"]
+}
+
+export type SessionsWorkPromptOutput = {
+  readonly data: {
+    readonly admittedSeq: number
+    readonly id: string
+    readonly sessionID: string
+    readonly prompt: {
+      readonly text: string
+      readonly files?: ReadonlyArray<{
+        readonly uri: string
+        readonly mime: string
+        readonly name?: string
+        readonly description?: string
+        readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+      }>
+      readonly agents?: ReadonlyArray<{
+        readonly name: string
+        readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+      }>
+    }
+    readonly delivery: "steer" | "queue"
+    readonly timeCreated: number
+    readonly promotedSeq?: number
+  }
+}["data"]
+
+export type SessionsWorkInterruptInput = {
+  readonly sessionID: { readonly sessionID: string; readonly workID: string }["sessionID"]
+  readonly workID: { readonly sessionID: string; readonly workID: string }["workID"]
+}
+
+export type SessionsWorkInterruptOutput = void
+
 export type SessionsCompactInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 
 export type SessionsCompactOutput = void
@@ -542,6 +615,7 @@ export type SessionsContextOutput = {
         readonly id: string
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number }
+        readonly workID?: string
         readonly text: string
         readonly files?: ReadonlyArray<{
           readonly uri: string
@@ -585,10 +659,17 @@ export type SessionsContextOutput = {
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number; readonly completed?: number }
         readonly type: "assistant"
+        readonly workID?: string
+        readonly inputMessageIDs?: ReadonlyArray<string>
         readonly agent: string
         readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
         readonly content: ReadonlyArray<
-          | { readonly type: "text"; readonly id: string; readonly text: string }
+          | {
+              readonly type: "text"
+              readonly id: string
+              readonly text: string
+              readonly providerMetadata?: { readonly [x: string]: { readonly [x: string]: JsonValue } }
+            }
           | {
               readonly type: "reasoning"
               readonly id: string
@@ -748,6 +829,7 @@ export type SessionsHistoryOutput = {
             }>
           }
           readonly delivery: "steer" | "queue"
+          readonly workID?: string
         }
       }
     | {
@@ -840,6 +922,8 @@ export type SessionsHistoryOutput = {
           readonly timestamp: number
           readonly sessionID: string
           readonly assistantMessageID: string
+          readonly workID?: string
+          readonly inputMessageIDs?: ReadonlyArray<string>
           readonly agent: string
           readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
           readonly snapshot?: string
@@ -883,6 +967,35 @@ export type SessionsHistoryOutput = {
     | {
         readonly id: string
         readonly metadata?: { readonly [x: string]: JsonValue }
+        readonly type: "session.next.work.started"
+        readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+        readonly location?: { readonly directory: string; readonly workspaceID?: string }
+        readonly data: {
+          readonly timestamp: number
+          readonly sessionID: string
+          readonly workID: string
+          readonly inputMessageIDs: ReadonlyArray<string>
+        }
+      }
+    | {
+        readonly id: string
+        readonly metadata?: { readonly [x: string]: JsonValue }
+        readonly type: "session.next.work.settled"
+        readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+        readonly location?: { readonly directory: string; readonly workspaceID?: string }
+        readonly data: {
+          readonly timestamp: number
+          readonly sessionID: string
+          readonly workID: string
+          readonly inputMessageIDs: ReadonlyArray<string>
+          readonly outcome: "completed" | "failed" | "cancelled"
+          readonly pendingInputMessageIDs?: ReadonlyArray<string>
+          readonly error?: { readonly type: "unknown"; readonly message: string }
+        }
+      }
+    | {
+        readonly id: string
+        readonly metadata?: { readonly [x: string]: JsonValue }
         readonly type: "session.next.text.started"
         readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
         readonly location?: { readonly directory: string; readonly workspaceID?: string }
@@ -891,6 +1004,9 @@ export type SessionsHistoryOutput = {
           readonly sessionID: string
           readonly assistantMessageID: string
           readonly textID: string
+          readonly workID?: string
+          readonly inputMessageIDs?: ReadonlyArray<string>
+          readonly providerMetadata?: { readonly [x: string]: { readonly [x: string]: JsonValue } }
         }
       }
     | {
@@ -905,6 +1021,9 @@ export type SessionsHistoryOutput = {
           readonly assistantMessageID: string
           readonly textID: string
           readonly text: string
+          readonly workID?: string
+          readonly inputMessageIDs?: ReadonlyArray<string>
+          readonly providerMetadata?: { readonly [x: string]: { readonly [x: string]: JsonValue } }
         }
       }
     | {
@@ -1206,6 +1325,7 @@ export type SessionsEventsOutput =
           }>
         }
         readonly delivery: "steer" | "queue"
+        readonly workID?: string
       }
     }
   | {
@@ -1298,6 +1418,8 @@ export type SessionsEventsOutput =
         readonly timestamp: number
         readonly sessionID: string
         readonly assistantMessageID: string
+        readonly workID?: string
+        readonly inputMessageIDs?: ReadonlyArray<string>
         readonly agent: string
         readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
         readonly snapshot?: string
@@ -1341,6 +1463,35 @@ export type SessionsEventsOutput =
   | {
       readonly id: string
       readonly metadata?: { readonly [x: string]: unknown }
+      readonly type: "session.next.work.started"
+      readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+      readonly location?: { readonly directory: string; readonly workspaceID?: string }
+      readonly data: {
+        readonly timestamp: number
+        readonly sessionID: string
+        readonly workID: string
+        readonly inputMessageIDs: ReadonlyArray<string>
+      }
+    }
+  | {
+      readonly id: string
+      readonly metadata?: { readonly [x: string]: unknown }
+      readonly type: "session.next.work.settled"
+      readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+      readonly location?: { readonly directory: string; readonly workspaceID?: string }
+      readonly data: {
+        readonly timestamp: number
+        readonly sessionID: string
+        readonly workID: string
+        readonly inputMessageIDs: ReadonlyArray<string>
+        readonly outcome: "completed" | "failed" | "cancelled"
+        readonly pendingInputMessageIDs?: ReadonlyArray<string>
+        readonly error?: { readonly type: "unknown"; readonly message: string }
+      }
+    }
+  | {
+      readonly id: string
+      readonly metadata?: { readonly [x: string]: unknown }
       readonly type: "session.next.text.started"
       readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
       readonly location?: { readonly directory: string; readonly workspaceID?: string }
@@ -1349,6 +1500,9 @@ export type SessionsEventsOutput =
         readonly sessionID: string
         readonly assistantMessageID: string
         readonly textID: string
+        readonly workID?: string
+        readonly inputMessageIDs?: ReadonlyArray<string>
+        readonly providerMetadata?: { readonly [x: string]: { readonly [x: string]: unknown } }
       }
     }
   | {
@@ -1363,6 +1517,9 @@ export type SessionsEventsOutput =
         readonly assistantMessageID: string
         readonly textID: string
         readonly text: string
+        readonly workID?: string
+        readonly inputMessageIDs?: ReadonlyArray<string>
+        readonly providerMetadata?: { readonly [x: string]: { readonly [x: string]: unknown } }
       }
     }
   | {
@@ -1620,6 +1777,7 @@ export type SessionsMessageOutput = {
         readonly id: string
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number }
+        readonly workID?: string
         readonly text: string
         readonly files?: ReadonlyArray<{
           readonly uri: string
@@ -1663,10 +1821,17 @@ export type SessionsMessageOutput = {
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number; readonly completed?: number }
         readonly type: "assistant"
+        readonly workID?: string
+        readonly inputMessageIDs?: ReadonlyArray<string>
         readonly agent: string
         readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
         readonly content: ReadonlyArray<
-          | { readonly type: "text"; readonly id: string; readonly text: string }
+          | {
+              readonly type: "text"
+              readonly id: string
+              readonly text: string
+              readonly providerMetadata?: { readonly [x: string]: { readonly [x: string]: JsonValue } }
+            }
           | {
               readonly type: "reasoning"
               readonly id: string
@@ -1792,6 +1957,7 @@ export type MessagesListOutput = {
         readonly id: string
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number }
+        readonly workID?: string
         readonly text: string
         readonly files?: ReadonlyArray<{
           readonly uri: string
@@ -1835,10 +2001,17 @@ export type MessagesListOutput = {
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number; readonly completed?: number }
         readonly type: "assistant"
+        readonly workID?: string
+        readonly inputMessageIDs?: ReadonlyArray<string>
         readonly agent: string
         readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
         readonly content: ReadonlyArray<
-          | { readonly type: "text"; readonly id: string; readonly text: string }
+          | {
+              readonly type: "text"
+              readonly id: string
+              readonly text: string
+              readonly providerMetadata?: { readonly [x: string]: { readonly [x: string]: JsonValue } }
+            }
           | {
               readonly type: "reasoning"
               readonly id: string
@@ -2302,6 +2475,7 @@ export type PermissionsListRequestsOutput = {
   }
   readonly data: ReadonlyArray<{
     readonly id: string
+    readonly generation?: string
     readonly sessionID: string
     readonly action: string
     readonly resources: ReadonlyArray<string>
@@ -2404,6 +2578,7 @@ export type PermissionsListInput = { readonly sessionID: { readonly sessionID: s
 export type PermissionsListOutput = {
   readonly data: ReadonlyArray<{
     readonly id: string
+    readonly generation?: string
     readonly sessionID: string
     readonly action: string
     readonly resources: ReadonlyArray<string>
@@ -2421,6 +2596,7 @@ export type PermissionsGetInput = {
 export type PermissionsGetOutput = {
   readonly data: {
     readonly id: string
+    readonly generation?: string
     readonly sessionID: string
     readonly action: string
     readonly resources: ReadonlyArray<string>
@@ -2433,8 +2609,48 @@ export type PermissionsGetOutput = {
 export type PermissionsReplyInput = {
   readonly sessionID: { readonly sessionID: string; readonly requestID: string }["sessionID"]
   readonly requestID: { readonly sessionID: string; readonly requestID: string }["requestID"]
-  readonly reply: { readonly reply: "once" | "always" | "reject"; readonly message?: string | undefined }["reply"]
-  readonly message?: { readonly reply: "once" | "always" | "reject"; readonly message?: string | undefined }["message"]
+  readonly reply: {
+    readonly reply: "once" | "always" | "reject"
+    readonly message?: string | null
+    readonly expectedRequest?: {
+      readonly id: string
+      readonly generation?: string
+      readonly sessionID: string
+      readonly action: string
+      readonly resources: ReadonlyArray<string>
+      readonly save?: ReadonlyArray<string>
+      readonly metadata?: { readonly [x: string]: JsonValue }
+      readonly source?: { readonly type: "tool"; readonly messageID: string; readonly callID: string }
+    } | null
+  }["reply"]
+  readonly message?: {
+    readonly reply: "once" | "always" | "reject"
+    readonly message?: string | null
+    readonly expectedRequest?: {
+      readonly id: string
+      readonly generation?: string
+      readonly sessionID: string
+      readonly action: string
+      readonly resources: ReadonlyArray<string>
+      readonly save?: ReadonlyArray<string>
+      readonly metadata?: { readonly [x: string]: JsonValue }
+      readonly source?: { readonly type: "tool"; readonly messageID: string; readonly callID: string }
+    } | null
+  }["message"]
+  readonly expectedRequest?: {
+    readonly reply: "once" | "always" | "reject"
+    readonly message?: string | null
+    readonly expectedRequest?: {
+      readonly id: string
+      readonly generation?: string
+      readonly sessionID: string
+      readonly action: string
+      readonly resources: ReadonlyArray<string>
+      readonly save?: ReadonlyArray<string>
+      readonly metadata?: { readonly [x: string]: JsonValue }
+      readonly source?: { readonly type: "tool"; readonly messageID: string; readonly callID: string }
+    } | null
+  }["expectedRequest"]
 }
 
 export type PermissionsReplyOutput = void

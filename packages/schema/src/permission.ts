@@ -33,6 +33,7 @@ const RequestFields = {
 
 export const Request = Schema.Struct({
   id: ID,
+  generation: Schema.String.pipe(optional),
   ...RequestFields,
 }).annotate({ identifier: "PermissionV2.Request" })
 export interface Request extends Schema.Schema.Type<typeof Request> {}

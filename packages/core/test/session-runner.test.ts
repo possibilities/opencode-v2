@@ -27,6 +27,7 @@ import { Snapshot } from "@opencode-ai/core/snapshot"
 import { ContextSnapshotDecodeError } from "@opencode-ai/core/session/error"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionWorkControl } from "@opencode-ai/core/session/work-control"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { Prompt } from "@opencode-ai/core/session/prompt"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
@@ -271,6 +272,7 @@ const it = testEffect(
       Config.node,
       Snapshot.node,
       SessionRunnerLLM.node,
+      SessionWorkControl.node,
       SessionExecution.node,
       SessionV2.node,
     ]),
@@ -622,6 +624,7 @@ describe("SessionRunnerLLM", () => {
       response = []
 
       const message = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run automatically" }) })
+      while (requests.length < 1) yield* Effect.yieldNow
 
       expect(requests).toHaveLength(1)
       expect(yield* session.messages({ sessionID })).toMatchObject([
@@ -681,6 +684,7 @@ describe("SessionRunnerLLM", () => {
 
       systemUnavailable = false
       yield* session.prompt({ id: messageID, sessionID, prompt: Prompt.make({ text: "First" }) })
+      while (requests.length < 1) yield* Effect.yieldNow
 
       expect(requests).toHaveLength(1)
       expect(requests[0]?.messages.map((message) => message.role)).toEqual(["user"])
@@ -2254,7 +2258,7 @@ describe("SessionRunnerLLM", () => {
       streamFailure = undefined
       streamGate = undefined
       streamStarted = undefined
-      yield* Effect.yieldNow
+      while (requests.length < 2) yield* Effect.yieldNow
 
       expect(requests).toHaveLength(2)
       expect(userTexts(requests[1]!)).toEqual(["Start working", "Recover with this"])
@@ -2505,7 +2509,7 @@ describe("SessionRunnerLLM", () => {
       const first = yield* session.resume(sessionID).pipe(Effect.forkChild)
       yield* Deferred.await(streamStarted)
       const second = yield* session.resume(otherSessionID).pipe(Effect.forkChild)
-      yield* Effect.yieldNow
+      while (requests.length < 2) yield* Effect.yieldNow
 
       expect(requests).toHaveLength(2)
       expect(requests.map((request) => request.providerOptions?.openai?.promptCacheKey)).toEqual([
@@ -3470,6 +3474,449 @@ describe("SessionRunnerLLM", () => {
       expect(yield* session.resume(sessionID).pipe(Effect.catchDefect(Effect.succeed))).toBe(
         "Tool input delta before start: call-1",
       )
+    }),
+  )
+  it.effect("settles exact work membership across queue holes and replays provider text metadata", () =>
+    Effect.gen(function* () {
+      yield* setup
+      requests.length = 0
+      const session = yield* SessionV2.Service
+      const db = (yield* Database.Service).db
+      const queued = yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Queued first" }),
+        delivery: "queue",
+        resume: false,
+      })
+      const steered = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Steer later" }), resume: false })
+      response = [
+        LLMEvent.textStart({
+          id: "provider-item",
+          providerMetadata: { openai: { itemId: "provider-item", phase: "commentary" } },
+        }),
+        LLMEvent.textDelta({ id: "provider-item", text: "Draft" }),
+        LLMEvent.textEnd({
+          id: "provider-item",
+          text: "Authoritative",
+          providerMetadata: { openai: { itemId: "provider-item", phase: "final_answer" } },
+        }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      ]
+      yield* session.resume(sessionID)
+      const rows = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, sessionID))
+        .orderBy(asc(EventTable.seq))
+        .all()
+      const settled = rows.filter((event) => event.type === "session.next.work.settled.1")
+      expect(settled).toHaveLength(2)
+      expect(settled.map((event) => event.data)).toMatchObject([
+        { inputMessageIDs: [steered.id], outcome: "completed" },
+        { inputMessageIDs: [queued.id], outcome: "completed" },
+      ])
+      expect(settled[0]?.data.workID).not.toBe(settled[1]?.data.workID)
+      const expected = [
+        { type: "user", workID: settled[0]?.data.workID },
+        {
+          type: "assistant",
+          workID: settled[0]?.data.workID,
+          inputMessageIDs: [steered.id],
+          content: [
+            {
+              id: "provider-item",
+              text: "Authoritative",
+              providerMetadata: { openai: { itemId: "provider-item", phase: "final_answer" } },
+            },
+          ],
+        },
+        { type: "user", workID: settled[1]?.data.workID },
+        { type: "assistant", workID: settled[1]?.data.workID, inputMessageIDs: [queued.id] },
+      ]
+      expect(yield* session.context(sessionID)).toMatchObject(expected)
+      yield* replaySessionProjection(sessionID)
+      expect(yield* session.context(sessionID)).toMatchObject(expected)
+      expect(requests[1]?.messages.flatMap((message) => message.content)).toContainEqual({
+        type: "text",
+        text: "Authoritative",
+        providerMetadata: { openai: { itemId: "provider-item", phase: "final_answer" } },
+      })
+    }),
+  )
+
+  it.effect("atomically admits guarded steers to one work and reconciles retries after settlement", () =>
+    Effect.gen(function* () {
+      yield* setup
+      requests.length = 0
+      const session = yield* SessionV2.Service
+      const control = yield* SessionWorkControl.Service
+      const db = (yield* Database.Service).db
+      const first = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
+      response = [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      ]
+      streamGate = yield* Deferred.make<void>()
+      streamStarted = yield* Deferred.make<void>()
+      const running = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      yield* Deferred.await(streamStarted)
+      const started = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.type, "session.next.work.started.1"))
+        .all()
+      const workID = started[0]?.data.workID
+      if (typeof workID !== "string") return yield* Effect.die("Work did not start")
+      const guarded = {
+        id: SessionMessage.ID.make("msg_guarded_steer"),
+        sessionID,
+        prompt: Prompt.make({ text: "Guarded" }),
+        expectedWorkID: workID,
+      }
+      const pending = yield* session.prompt(guarded).pipe(Effect.forkChild)
+      while ((yield* control.pending(sessionID)) !== 1) yield* Effect.yieldNow
+      expect(yield* SessionInput.find(db, guarded.id)).toBeUndefined()
+      yield* Deferred.succeed(streamGate, undefined)
+      const admitted = yield* Fiber.join(pending)
+      yield* Fiber.join(running)
+      expect(admitted.promotedSeq).toBe(admitted.admittedSeq)
+      expect(yield* session.prompt(guarded)).toEqual(admitted)
+      expect(yield* session.prompt({ ...guarded, expectedWorkID: "work_other" }).pipe(Effect.flip)).toMatchObject({
+        _tag: "Session.PromptConflictError",
+      })
+      expect(userTexts(requests[1]!)).toEqual(["First", "Guarded"])
+      const settled = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.type, "session.next.work.settled.1"))
+        .all()
+      expect(settled.map((event) => event.data)).toMatchObject([
+        { workID, inputMessageIDs: [first.id, guarded.id], outcome: "completed" },
+      ])
+      expect(
+        yield* db.select().from(EventTable).where(eq(EventTable.type, "session.next.prompt.admitted.1")).all(),
+      ).toHaveLength(1)
+    }),
+  )
+
+  it.effect("rejects stale work controls while a newer provider work is running", () =>
+    Effect.gen(function* () {
+      yield* setup
+      requests.length = 0
+      const session = yield* SessionV2.Service
+      const db = (yield* Database.Service).db
+      response = [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      ]
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "A" }), resume: false })
+      yield* session.resume(sessionID)
+      const started = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.type, "session.next.work.started.1"))
+        .all()
+      const oldWorkID = started[0]?.data.workID
+      if (typeof oldWorkID !== "string") return yield* Effect.die("Work A did not start")
+      const second = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "B" }), resume: false })
+      streamGate = yield* Deferred.make<void>()
+      streamStarted = yield* Deferred.make<void>()
+      const running = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      yield* Deferred.await(streamStarted)
+      const staleID = SessionMessage.ID.make("msg_stale_work_steer")
+      expect(yield* session.interrupt(sessionID, oldWorkID).pipe(Effect.flip)).toMatchObject({
+        _tag: "Session.WorkChangedError",
+      })
+      expect(
+        yield* session
+          .prompt({ id: staleID, sessionID, prompt: Prompt.make({ text: "Stale" }), expectedWorkID: oldWorkID })
+          .pipe(Effect.flip),
+      ).toMatchObject({ _tag: "Session.WorkChangedError" })
+      expect(yield* SessionInput.find(db, staleID)).toBeUndefined()
+      yield* Deferred.succeed(streamGate, undefined)
+      yield* Fiber.join(running)
+      const settled = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.type, "session.next.work.settled.1"))
+        .orderBy(asc(EventTable.seq))
+        .all()
+      expect(settled.at(-1)?.data).toMatchObject({ inputMessageIDs: [second.id], outcome: "completed" })
+      expect(requests).toHaveLength(2)
+    }),
+  )
+
+  it.effect("rejects unadmitted guarded steers when their provider work fails", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const control = yield* SessionWorkControl.Service
+      const db = (yield* Database.Service).db
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Fail A" }), resume: false })
+      streamFailure = providerUnavailable()
+      streamGate = yield* Deferred.make<void>()
+      streamStarted = yield* Deferred.make<void>()
+      const running = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      yield* Deferred.await(streamStarted)
+      const started = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.type, "session.next.work.started.1"))
+        .all()
+      const workID = started[0]?.data.workID
+      if (typeof workID !== "string") return yield* Effect.die("Work did not start")
+      const id = SessionMessage.ID.make("msg_never_admitted")
+      const pending = yield* session
+        .prompt({ id, sessionID, prompt: Prompt.make({ text: "Never move to B" }), expectedWorkID: workID })
+        .pipe(Effect.forkChild)
+      while ((yield* control.pending(sessionID)) !== 1) yield* Effect.yieldNow
+      yield* Deferred.succeed(streamGate, undefined)
+      expect(yield* Fiber.await(running)).toMatchObject({ _tag: "Failure" })
+      expect(yield* Fiber.join(pending).pipe(Effect.flip)).toMatchObject({ _tag: "Session.WorkChangedError" })
+      expect(yield* SessionInput.find(db, id)).toBeUndefined()
+      expect(yield* control.pending(sessionID)).toBe(0)
+    }),
+  )
+
+  it.effect(
+    "enforces the membership cap when two guarded steers race for the final slot",
+    () =>
+      Effect.gen(function* () {
+        yield* setup
+        requests.length = 0
+        const session = yield* SessionV2.Service
+        const control = yield* SessionWorkControl.Service
+        const db = (yield* Database.Service).db
+        for (let index = 0; index < SessionInput.MAX_WORK_INPUTS - 1; index++)
+          yield* session.prompt({
+            id: SessionMessage.ID.make(`msg_cap_${index}`),
+            sessionID,
+            prompt: Prompt.make({ text: "Seed" }),
+            resume: false,
+          })
+        response = [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+          LLMEvent.finish({ reason: "stop" }),
+        ]
+        streamGate = yield* Deferred.make<void>()
+        streamStarted = yield* Deferred.make<void>()
+        const running = yield* session.resume(sessionID).pipe(Effect.forkChild)
+        yield* Deferred.await(streamStarted)
+        const started = yield* db
+          .select()
+          .from(EventTable)
+          .where(eq(EventTable.type, "session.next.work.started.1"))
+          .all()
+        const workID = started[0]?.data.workID
+        if (typeof workID !== "string") return yield* Effect.die("Work did not start")
+        const winner = {
+          id: SessionMessage.ID.make("msg_cap_winner"),
+          sessionID,
+          prompt: Prompt.make({ text: "Last slot" }),
+          expectedWorkID: workID,
+        }
+        const loser = {
+          ...winner,
+          id: SessionMessage.ID.make("msg_cap_loser"),
+          prompt: Prompt.make({ text: "No slot" }),
+        }
+        const first = yield* session.prompt(winner).pipe(Effect.forkChild)
+        while ((yield* control.pending(sessionID)) !== 1) yield* Effect.yieldNow
+        const second = yield* session.prompt(loser).pipe(Effect.forkChild)
+        while ((yield* control.pending(sessionID)) !== 2) yield* Effect.yieldNow
+        yield* Deferred.succeed(streamGate, undefined)
+        const admitted = yield* Fiber.join(first)
+        expect(yield* Fiber.join(second).pipe(Effect.flip)).toMatchObject({ _tag: "Session.WorkChangedError" })
+        yield* Fiber.join(running)
+        expect(yield* SessionInput.find(db, loser.id)).toBeUndefined()
+        expect(yield* session.prompt(winner)).toEqual(admitted)
+        const settled = yield* db
+          .select()
+          .from(EventTable)
+          .where(eq(EventTable.type, "session.next.work.settled.1"))
+          .all()
+        expect(settled).toHaveLength(1)
+        expect(settled[0]?.data.inputMessageIDs).toHaveLength(SessionInput.MAX_WORK_INPUTS)
+        expect(requests).toHaveLength(2)
+      }),
+    20_000,
+  )
+
+  it.effect("preserves atomic guarded admission when interruption races with its committed response", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const control = yield* SessionWorkControl.Service
+      const events = yield* EventV2.Service
+      const db = (yield* Database.Service).db
+      const initial = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Initial" }), resume: false })
+      response = [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      ]
+      streamGate = yield* Deferred.make<void>()
+      streamStarted = yield* Deferred.make<void>()
+      const running = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      yield* Deferred.await(streamStarted)
+      const started = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.type, "session.next.work.started.1"))
+        .all()
+      const workID = started[0]?.data.workID
+      if (typeof workID !== "string") return yield* Effect.die("Work did not start")
+      const committed = yield* Deferred.make<void>()
+      const responseGate = yield* Deferred.make<void>()
+      const guarded = {
+        id: SessionMessage.ID.make("msg_commit_race"),
+        sessionID,
+        prompt: Prompt.make({ text: "Committed" }),
+        expectedWorkID: workID,
+      }
+      yield* events.listen((event) =>
+        Schema.is(SessionEvent.Prompted)(event) && event.data.messageID === guarded.id
+          ? Deferred.succeed(committed, undefined).pipe(Effect.andThen(Deferred.await(responseGate)))
+          : Effect.void,
+      )
+      const pending = yield* session.prompt(guarded).pipe(Effect.forkChild)
+      while ((yield* control.pending(sessionID)) !== 1) yield* Effect.yieldNow
+      yield* Deferred.succeed(streamGate, undefined)
+      yield* Deferred.await(committed)
+      const interruption = yield* session.interrupt(sessionID, workID).pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      expect((yield* SessionInput.find(db, guarded.id))?.promotedSeq).toBeDefined()
+      yield* Deferred.succeed(responseGate, undefined)
+      const admitted = yield* Fiber.join(pending)
+      yield* Fiber.join(interruption)
+      expect(yield* Fiber.await(running)).toMatchObject({ _tag: "Failure" })
+      expect(yield* session.prompt(guarded)).toEqual(admitted)
+      const settled = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.type, "session.next.work.settled.1"))
+        .all()
+      expect(settled.map((event) => event.data)).toMatchObject([
+        { workID, inputMessageIDs: [initial.id, guarded.id], outcome: "cancelled" },
+      ])
+    }),
+  )
+
+  it.effect("keeps provider steps inside one work until tool continuation settles", () =>
+    Effect.gen(function* () {
+      yield* setup
+      requests.length = 0
+      const session = yield* SessionV2.Service
+      const db = (yield* Database.Service).db
+      const admitted = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Use a tool" }), resume: false })
+      responses = [
+        [
+          LLMEvent.toolCall({ id: "call-work", name: "echo", input: { text: "work" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        [
+          LLMEvent.textStart({ id: "final-work" }),
+          LLMEvent.textDelta({ id: "final-work", text: "Done" }),
+          LLMEvent.textEnd({ id: "final-work" }),
+          LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+          LLMEvent.finish({ reason: "stop" }),
+        ],
+      ]
+      yield* session.resume(sessionID)
+      const rows = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, sessionID))
+        .orderBy(asc(EventTable.seq))
+        .all()
+      expect(rows.filter((event) => event.type === "session.next.step.ended.2")).toHaveLength(2)
+      const settled = rows.filter((event) => event.type === "session.next.work.settled.1")
+      expect(settled.map((event) => event.data)).toMatchObject([
+        { inputMessageIDs: [admitted.id], outcome: "completed" },
+      ])
+      expect(
+        rows.filter((event) => event.type === "session.next.step.started.1").map((event) => event.data.workID),
+      ).toEqual([settled[0]?.data.workID, settled[0]?.data.workID])
+    }),
+  )
+
+  for (const failure of ["provider-error", "missing-terminal"] as const) {
+    it.effect(`settles work as failed after ${failure}`, () =>
+      Effect.gen(function* () {
+        yield* setup
+        requests.length = 0
+        const session = yield* SessionV2.Service
+        const db = (yield* Database.Service).db
+        const admitted = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: failure }), resume: false })
+        response = failure === "provider-error" ? [LLMEvent.providerError({ message: "Unavailable" })] : []
+        yield* session.resume(sessionID)
+        const rows = yield* db.select().from(EventTable).where(eq(EventTable.type, "session.next.work.settled.1")).all()
+        expect(rows.map((event) => event.data)).toMatchObject([
+          { inputMessageIDs: [admitted.id], outcome: "failed", error: { message: "Work failed" } },
+        ])
+      }),
+    )
+  }
+
+  it.effect("settles interrupted work without attributing an older orphaned work", () =>
+    Effect.gen(function* () {
+      yield* setup
+      requests.length = 0
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      const db = (yield* Database.Service).db
+      yield* events.publish(SessionEvent.Work.Started, {
+        sessionID,
+        timestamp: yield* DateTime.now,
+        workID: "work_orphan",
+        inputMessageIDs: [],
+      })
+      const admitted = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Cancel" }), resume: false })
+      const ready = yield* Deferred.make<void>()
+      responseStream = Stream.fromEffect(Deferred.succeed(ready, undefined)).pipe(Stream.flatMap(() => Stream.never))
+      const runner = yield* SessionRunner.Service
+      const running = yield* runner.run({ sessionID, force: true }).pipe(Effect.forkChild)
+      yield* Deferred.await(ready)
+      yield* Fiber.interrupt(running)
+      const rows = yield* db.select().from(EventTable).where(eq(EventTable.type, "session.next.work.settled.1")).all()
+      expect(rows).toHaveLength(1)
+      expect(rows[0]?.data).toMatchObject({ inputMessageIDs: [admitted.id], outcome: "cancelled" })
+      expect(rows[0]?.data.workID).not.toBe("work_orphan")
+    }),
+  )
+  it.effect("reports selected unpromoted inputs when initial context blocks work", () =>
+    Effect.gen(function* () {
+      yield* setup
+      requests.length = 0
+      const session = yield* SessionV2.Service
+      const db = (yield* Database.Service).db
+      const queued = yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Queue remains pending" }),
+        delivery: "queue",
+        resume: false,
+      })
+      const steer = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Blocked steer" }), resume: false })
+      systemUnavailable = true
+      const exit = yield* session.resume(sessionID).pipe(Effect.exit)
+      expect(exit._tag).toBe("Failure")
+      const rows = yield* db.select().from(EventTable).where(eq(EventTable.type, "session.next.work.settled.1")).all()
+      expect(rows.map((row) => row.data)).toMatchObject([
+        {
+          inputMessageIDs: [],
+          pendingInputMessageIDs: [steer.id],
+          outcome: "failed",
+          error: { message: "Work blocked before prompt promotion; retry explicitly" },
+        },
+      ])
+      expect((yield* SessionInput.find(db, steer.id))?.promotedSeq).toBeUndefined()
+      expect((yield* SessionInput.find(db, queued.id))?.promotedSeq).toBeUndefined()
+      expect(requests).toHaveLength(0)
     }),
   )
 })

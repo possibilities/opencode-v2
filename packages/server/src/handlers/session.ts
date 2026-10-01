@@ -12,9 +12,16 @@ import {
   UnknownError,
 } from "@opencode-ai/protocol/errors"
 import { AbsolutePath } from "@opencode-ai/core/schema"
+import { SessionWorkControl } from "@opencode-ai/core/session/work-control"
 
 const DefaultSessionsLimit = 50
 const DefaultSessionHistoryLimit = 50
+
+const workChanged = (error: SessionWorkControl.ChangedError) =>
+  new ConflictError({
+    resource: error.workID,
+    message: "Work is no longer accepting this operation; no input was admitted",
+  })
 
 export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handlers) =>
   Effect.gen(function* () {
@@ -165,8 +172,50 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                     }),
                   ),
                 ),
+                Effect.catchTag("Session.WorkChangedError", workChanged),
               ),
           }
+        }),
+      )
+      .handle(
+        "session.workPrompt",
+        Effect.fn(function* (ctx) {
+          return {
+            data: yield* session
+              .prompt({
+                ...ctx.payload,
+                sessionID: ctx.params.sessionID,
+                expectedWorkID: ctx.params.workID,
+              })
+              .pipe(
+                Effect.catchTag(
+                  "Session.NotFoundError",
+                  (error) =>
+                    new SessionNotFoundError({
+                      sessionID: error.sessionID,
+                      message: `Session not found: ${error.sessionID}`,
+                    }),
+                ),
+                Effect.catchTag(
+                  "Session.PromptConflictError",
+                  (error) =>
+                    new ConflictError({
+                      resource: error.messageID,
+                      message: "Prompt conflicts with its existing durable admission or work",
+                    }),
+                ),
+                Effect.catchTag("Session.WorkChangedError", workChanged),
+              ),
+          }
+        }),
+      )
+      .handle(
+        "session.workInterrupt",
+        Effect.fn(function* (ctx) {
+          yield* session
+            .interrupt(ctx.params.sessionID, ctx.params.workID)
+            .pipe(Effect.catchTag("Session.WorkChangedError", workChanged))
+          return HttpApiSchema.NoContent.make()
         }),
       )
       .handle(
@@ -365,7 +414,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.interrupt",
         Effect.fn(function* (ctx) {
-          yield* session.interrupt(ctx.params.sessionID)
+          yield* session.interrupt(ctx.params.sessionID).pipe(Effect.orDie)
           return HttpApiSchema.NoContent.make()
         }),
       )

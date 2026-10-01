@@ -99,6 +99,7 @@ export type TextDelta = Schema.Schema.Type<typeof TextDelta>
 export const TextEnd = Schema.Struct({
   type: Schema.tag("text-end"),
   id: ContentBlockID,
+  text: Schema.optional(Schema.String),
   providerMetadata: Schema.optional(ProviderMetadata),
 }).annotate({ identifier: "LLM.Event.TextEnd" })
 export type TextEnd = Schema.Schema.Type<typeof TextEnd>
@@ -317,10 +318,10 @@ export type PreparedRequestOf<Body> = Omit<PreparedRequest, "body"> & {
   readonly body: Body
 }
 
-const responseText = (events: ReadonlyArray<LLMEvent>) =>
-  events
-    .filter(LLMEvent.is.textDelta)
-    .map((event) => event.text)
+const responseText = (message: Message) =>
+  message.content
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
     .join("")
 
 const responseReasoning = (events: ReadonlyArray<LLMEvent>) =>
@@ -436,8 +437,8 @@ const reduceTextEnd = (state: ResponseState, event: TextEnd): ResponseState => {
   if (!current) return state
   const providerMetadata = event.providerMetadata ?? current.providerMetadata
   return {
-    ...replaceContent(state, current.contentIndex, textContent(current.text, providerMetadata)),
-    textParts: { ...state.textParts, [event.id]: { ...current, providerMetadata } },
+    ...replaceContent(state, current.contentIndex, textContent(event.text ?? current.text, providerMetadata)),
+    textParts: { ...state.textParts, [event.id]: { ...current, text: event.text ?? current.text, providerMetadata } },
   }
 }
 
@@ -564,9 +565,9 @@ export class LLMResponse extends Schema.Class<LLMResponse>("LLM.Response")({
   usage: Schema.optional(Usage),
   finishReason: FinishReason,
 }) {
-  /** Concatenated assistant text assembled from streamed `text-delta` events. */
+  /** Concatenated assistant text, including authoritative full-value text endings. */
   get text() {
-    return responseText(this.events)
+    return responseText(this.message)
   }
 
   /** Concatenated reasoning text assembled from streamed `reasoning-delta` events. */
@@ -605,7 +606,8 @@ export namespace LLMResponse {
   export const fromEvents = (events: ReadonlyArray<LLMEvent>) => complete(events.reduce(reduce, empty()))
 
   /** Concatenate assistant text from a response or collected event list. */
-  export const text = (response: Output) => responseText(response.events)
+  export const text = (response: Output) =>
+    responseText("message" in response ? response.message : response.events.reduce(reduce, empty()).message)
 
   /** Return response usage, falling back to the latest usage-bearing event. */
   export const usage = (response: Output) => response.usage ?? responseUsage(response.events)

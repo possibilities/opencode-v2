@@ -3,10 +3,16 @@ import { LLMEvent, type FinishReason, type ProviderMetadata, type Usage } from "
 export interface State {
   readonly stepStarted: boolean
   readonly text: ReadonlySet<string>
+  readonly textMetadata: ReadonlyMap<string, ProviderMetadata>
   readonly reasoning: ReadonlySet<string>
 }
 
-export const initial = (): State => ({ stepStarted: false, text: new Set(), reasoning: new Set() })
+export const initial = (): State => ({
+  stepStarted: false,
+  text: new Set(),
+  textMetadata: new Map(),
+  reasoning: new Set(),
+})
 
 export const stepStart = (state: State, events: LLMEvent[]): State => {
   if (state.stepStarted) return state
@@ -14,14 +20,44 @@ export const stepStart = (state: State, events: LLMEvent[]): State => {
   return { ...state, stepStarted: true }
 }
 
-export const textDelta = (state: State, events: LLMEvent[], id: string, text: string): State => {
+export const textStart = (state: State, events: LLMEvent[], id: string, providerMetadata?: ProviderMetadata): State => {
+  if (state.text.has(id)) return state
+  const stepped = stepStart(state, events)
+  events.push(LLMEvent.textStart({ id, ...(providerMetadata === undefined ? {} : { providerMetadata }) }))
+  return {
+    ...stepped,
+    text: new Set([...stepped.text, id]),
+    textMetadata:
+      providerMetadata === undefined
+        ? stepped.textMetadata
+        : new Map([...stepped.textMetadata, [id, providerMetadata]]),
+  }
+}
+
+export const textDelta = (
+  state: State,
+  events: LLMEvent[],
+  id: string,
+  text: string,
+  providerMetadata?: ProviderMetadata,
+): State => {
   const stepped = stepStart(state, events)
   if (stepped.text.has(id)) {
-    events.push(LLMEvent.textDelta({ id, text }))
+    events.push(LLMEvent.textDelta({ id, text, ...(providerMetadata === undefined ? {} : { providerMetadata }) }))
     return stepped
   }
-  events.push(LLMEvent.textStart({ id }), LLMEvent.textDelta({ id, text }))
-  return { ...stepped, text: new Set([...stepped.text, id]) }
+  events.push(
+    LLMEvent.textStart({ id, ...(providerMetadata === undefined ? {} : { providerMetadata }) }),
+    LLMEvent.textDelta({ id, text, ...(providerMetadata === undefined ? {} : { providerMetadata }) }),
+  )
+  return {
+    ...stepped,
+    text: new Set([...stepped.text, id]),
+    textMetadata:
+      providerMetadata === undefined
+        ? stepped.textMetadata
+        : new Map([...stepped.textMetadata, [id, providerMetadata]]),
+  }
 }
 
 export const reasoningStart = (
@@ -62,19 +98,35 @@ export const reasoningEnd = (
   return { ...stepped, reasoning }
 }
 
-export const textEnd = (state: State, events: LLMEvent[], id: string, providerMetadata?: ProviderMetadata): State => {
+export const textEnd = (
+  state: State,
+  events: LLMEvent[],
+  id: string,
+  providerMetadata?: ProviderMetadata,
+  finalText?: string,
+): State => {
   if (!state.text.has(id)) return state
   const stepped = stepStart(state, events)
-  events.push(LLMEvent.textEnd({ id, providerMetadata }))
+  events.push(
+    LLMEvent.textEnd({
+      id,
+      ...(finalText === undefined ? {} : { text: finalText }),
+      ...((providerMetadata ?? state.textMetadata.get(id)) === undefined
+        ? {}
+        : { providerMetadata: providerMetadata ?? state.textMetadata.get(id) }),
+    }),
+  )
   const text = new Set(stepped.text)
   text.delete(id)
-  return { ...stepped, text }
+  const textMetadata = new Map(stepped.textMetadata)
+  textMetadata.delete(id)
+  return { ...stepped, text, textMetadata }
 }
 
 const closeOpenBlocks = (state: State, events: LLMEvent[]): State => {
   for (const id of state.reasoning) events.push(LLMEvent.reasoningEnd({ id }))
-  for (const id of state.text) events.push(LLMEvent.textEnd({ id }))
-  return { ...state, text: new Set(), reasoning: new Set() }
+  for (const id of state.text) events.push(LLMEvent.textEnd({ id, providerMetadata: state.textMetadata.get(id) }))
+  return { ...state, text: new Set(), textMetadata: new Map(), reasoning: new Set() }
 }
 
 export const finish = (

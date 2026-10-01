@@ -223,6 +223,39 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S>(sessionLo
         ),
     )
     .add(
+      HttpApiEndpoint.post("session.workPrompt", "/api/session/:sessionID/work/:workID/prompt", {
+        params: { sessionID: Session.ID, workID: Schema.String },
+        payload: Schema.Struct({ id: SessionMessage.ID, prompt: PromptInput.Prompt }),
+        success: Schema.Struct({ data: SessionInput.Admitted }),
+        error: [ConflictError, SessionNotFoundError],
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "v2.session.workPrompt",
+            summary: "Steer one exact active work",
+            description:
+              "Wait for a safe boundary, then atomically admit and promote to this work. Reject stale work without admission.",
+          }),
+        ),
+    )
+    .add(
+      HttpApiEndpoint.post("session.workInterrupt", "/api/session/:sessionID/work/:workID/interrupt", {
+        params: { sessionID: Session.ID, workID: Schema.String },
+        success: HttpApiSchema.NoContent,
+        error: ConflictError,
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "v2.session.workInterrupt",
+            summary: "Interrupt one exact active work",
+            description:
+              "Interrupt the captured owner of this work, rejecting stale work without affecting its successor.",
+          }),
+        ),
+    )
+    .add(
       HttpApiEndpoint.post("session.compact", "/api/session/:sessionID/compact", {
         params: { sessionID: Session.ID },
         success: HttpApiSchema.NoContent,

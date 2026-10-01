@@ -87,7 +87,7 @@ export type Moved = typeof Moved.Type
 export const Prompted = Event.define({
   type: "session.next.prompted",
   ...options,
-  schema: PromptFields,
+  schema: { ...PromptFields, workID: Schema.String.pipe(optional) },
 })
 export type Prompted = typeof Prompted.Type
 
@@ -152,6 +152,8 @@ export namespace Step {
     schema: {
       ...Base,
       assistantMessageID: SessionMessage.ID,
+      workID: Schema.String.pipe(optional),
+      inputMessageIDs: Schema.Array(SessionMessage.ID).pipe(optional),
       agent: Schema.String,
       model: Model.Ref,
       snapshot: Schema.String.pipe(optional),
@@ -194,6 +196,35 @@ export namespace Step {
   export type Failed = typeof Failed.Type
 }
 
+/** One admitted user-work continuation, including tools and steering, never a local drain. */
+export namespace Work {
+  export const Started = Event.define({
+    type: "session.next.work.started",
+    ...options,
+    schema: {
+      ...Base,
+      workID: Schema.String,
+      inputMessageIDs: Schema.Array(SessionMessage.ID),
+    },
+  })
+  export type Started = typeof Started.Type
+
+  export const Settled = Event.define({
+    type: "session.next.work.settled",
+    ...options,
+    schema: {
+      ...Base,
+      workID: Schema.String,
+      inputMessageIDs: Schema.Array(SessionMessage.ID),
+      outcome: Schema.Literals(["completed", "failed", "cancelled"]),
+      // Selected inputs that remain admitted, requiring an explicit retry after a blocked attempt.
+      pendingInputMessageIDs: Schema.Array(SessionMessage.ID).pipe(optional),
+      error: UnknownError.pipe(optional),
+    },
+  })
+  export type Settled = typeof Settled.Type
+}
+
 export namespace Text {
   export const Started = Event.define({
     type: "session.next.text.started",
@@ -202,6 +233,9 @@ export namespace Text {
       ...Base,
       assistantMessageID: SessionMessage.ID,
       textID: Schema.String,
+      workID: Schema.String.pipe(optional),
+      inputMessageIDs: Schema.Array(SessionMessage.ID).pipe(optional),
+      providerMetadata: ProviderMetadata.pipe(optional),
     },
   })
   export type Started = typeof Started.Type
@@ -214,6 +248,9 @@ export namespace Text {
       assistantMessageID: SessionMessage.ID,
       textID: Schema.String,
       delta: Schema.String,
+      workID: Schema.String.pipe(optional),
+      inputMessageIDs: Schema.Array(SessionMessage.ID).pipe(optional),
+      providerMetadata: ProviderMetadata.pipe(optional),
     },
   })
   export type Delta = typeof Delta.Type
@@ -226,6 +263,9 @@ export namespace Text {
       assistantMessageID: SessionMessage.ID,
       textID: Schema.String,
       text: Schema.String,
+      workID: Schema.String.pipe(optional),
+      inputMessageIDs: Schema.Array(SessionMessage.ID).pipe(optional),
+      providerMetadata: ProviderMetadata.pipe(optional),
     },
   })
   export type Ended = typeof Ended.Type
@@ -458,6 +498,8 @@ export const DurableDefinitions = Event.inventory(
   Step.Started,
   Step.Ended,
   Step.Failed,
+  Work.Started,
+  Work.Settled,
   Text.Started,
   Text.Ended,
   Tool.Input.Started,
@@ -489,6 +531,8 @@ export const Definitions = Event.inventory(
   Step.Started,
   Step.Ended,
   Step.Failed,
+  Work.Started,
+  Work.Settled,
   Text.Started,
   Text.Delta,
   Text.Ended,

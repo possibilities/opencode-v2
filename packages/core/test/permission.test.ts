@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Cause, Deferred, Effect, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Fiber, Layer, Schema } from "effect"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -310,6 +310,54 @@ describe("PermissionV2", () => {
       yield* service.assert(assertion({ id: PermissionV2.ID.create("per_next"), resources: ["src/next.ts"] }))
       yield* saved.remove(id)
       expect(yield* saved.list()).toEqual([])
+    }),
+  )
+  it.effect("rejects stale expected requests after a caller reuses the permission ID", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const service = yield* PermissionV2.Service
+      const db = (yield* Database.Service).db
+      yield* service.ask(assertion({ metadata: { preview: { command: "old" } } }))
+      const previous = yield* service.get(PermissionV2.ID.create("per_test"))
+      if (!previous) return yield* Effect.die("Permission fixture was not admitted")
+      const snapshot = Schema.decodeUnknownSync(PermissionV2.Request)(Schema.encodeSync(PermissionV2.Request)(previous))
+      yield* service.reply({ requestID: previous.id, reply: "once", expectedRequest: snapshot })
+      yield* service.ask(
+        assertion({
+          action: "edit",
+          resources: ["new-target"],
+          save: ["*"],
+          metadata: { preview: { command: "new" } },
+        }),
+      )
+      const current = yield* service.get(previous.id)
+      expect(
+        yield* service.reply({ requestID: previous.id, reply: "always", expectedRequest: snapshot }).pipe(Effect.flip),
+      ).toMatchObject({ _tag: "PermissionV2.RequestChangedError", requestID: previous.id })
+      expect(yield* service.get(previous.id)).toEqual(current)
+      expect(yield* db.select().from(PermissionTable).all()).toHaveLength(0)
+      yield* service.reply({ requestID: previous.id, reply: "once", expectedRequest: current })
+      expect(yield* service.get(previous.id)).toBeUndefined()
+    }),
+  )
+  it.effect("rejects identical-payload ABA replies using a core-assigned generation", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const service = yield* PermissionV2.Service
+      yield* service.ask(assertion())
+      const previous = yield* service.get(PermissionV2.ID.create("per_test"))
+      if (!previous) return yield* Effect.die("Permission fixture was not admitted")
+      yield* service.reply({ requestID: previous.id, reply: "once", expectedRequest: previous })
+      yield* service.ask(assertion())
+      const current = yield* service.get(previous.id)
+      if (!current) return yield* Effect.die("Replacement permission was not admitted")
+      expect(current.generation).toBeDefined()
+      expect(current.generation).not.toBe(previous.generation)
+      expect(
+        yield* service.reply({ requestID: previous.id, reply: "once", expectedRequest: previous }).pipe(Effect.flip),
+      ).toMatchObject({ _tag: "PermissionV2.RequestChangedError", requestID: previous.id })
+      expect(yield* service.get(previous.id)).toEqual(current)
+      yield* service.reply({ requestID: current.id, reply: "once", expectedRequest: current })
     }),
   )
 })

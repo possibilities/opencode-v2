@@ -11,6 +11,8 @@ type Input = {
   readonly agent: string
   readonly model: ModelV2.Ref
   readonly snapshot?: string
+  readonly workID?: string
+  readonly inputMessageIDs?: ReadonlyArray<SessionMessage.ID>
 }
 
 const safe = (value: number | undefined) => Math.max(0, Number.isFinite(value) ? (value ?? 0) : 0)
@@ -93,24 +95,28 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
     ended: (id: string, value: string, providerMetadata?: ProviderMetadata) => Effect.Effect<void>,
   ) => {
     const chunks = new Map<string, string[]>()
-    const start = (id: string) =>
+    const metadata = new Map<string, ProviderMetadata>()
+    const start = (id: string, providerMetadata?: ProviderMetadata) =>
       Effect.suspend(() => {
         if (chunks.has(id)) return Effect.die(`Duplicate ${name} start: ${id}`)
         chunks.set(id, [])
+        if (providerMetadata !== undefined) metadata.set(id, providerMetadata)
         return Effect.void
       })
-    const append = (id: string, value: string) =>
+    const append = (id: string, value: string, providerMetadata?: ProviderMetadata) =>
       Effect.suspend(() => {
         const current = chunks.get(id)
         if (!current) return Effect.die(`${name} delta before start: ${id}`)
         current.push(value)
+        if (providerMetadata !== undefined) metadata.set(id, providerMetadata)
         return Effect.void
       })
-    const end = Effect.fnUntraced(function* (id: string, providerMetadata?: ProviderMetadata) {
+    const end = Effect.fnUntraced(function* (id: string, providerMetadata?: ProviderMetadata, finalValue?: string) {
       const current = chunks.get(id)
       if (!current) return yield* Effect.die(`${name} end before start: ${id}`)
-      yield* ended(id, current.join(""), providerMetadata)
+      yield* ended(id, finalValue ?? current.join(""), providerMetadata ?? metadata.get(id))
       chunks.delete(id)
+      metadata.delete(id)
     })
     const flush = Effect.fnUntraced(function* () {
       for (const id of chunks.keys()) yield* end(id)
@@ -118,14 +124,17 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
     return { start, append, end, flush }
   }
 
-  const text = fragments("text", (textID, value) =>
+  const text = fragments("text", (textID, value, providerMetadata) =>
     Effect.gen(function* () {
       yield* events.publish(SessionEvent.Text.Ended, {
         sessionID: input.sessionID,
         assistantMessageID: yield* currentAssistantMessageID(),
         timestamp: yield* timestamp,
         textID,
+        workID: input.workID,
+        inputMessageIDs: input.inputMessageIDs,
         text: value,
+        providerMetadata,
       })
     }),
   )
@@ -244,26 +253,32 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
       case "step-start":
         return
       case "text-start":
-        yield* text.start(event.id)
+        yield* text.start(event.id, event.providerMetadata)
         yield* events.publish(SessionEvent.Text.Started, {
           sessionID: input.sessionID,
           assistantMessageID: yield* startAssistant(),
           timestamp: yield* timestamp,
           textID: event.id,
+          workID: input.workID,
+          inputMessageIDs: input.inputMessageIDs,
+          providerMetadata: event.providerMetadata,
         })
         return
       case "text-delta":
-        yield* text.append(event.id, event.text)
+        yield* text.append(event.id, event.text, event.providerMetadata)
         yield* events.publish(SessionEvent.Text.Delta, {
           sessionID: input.sessionID,
           assistantMessageID: yield* currentAssistantMessageID(),
           timestamp: yield* timestamp,
           textID: event.id,
+          workID: input.workID,
+          inputMessageIDs: input.inputMessageIDs,
           delta: event.text,
+          providerMetadata: event.providerMetadata,
         })
         return
       case "text-end":
-        yield* text.end(event.id)
+        yield* text.end(event.id, event.providerMetadata, event.text)
         return
       case "reasoning-start":
         yield* reasoning.start(event.id)

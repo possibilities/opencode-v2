@@ -29,6 +29,7 @@ import { SessionCompaction } from "../compaction"
 import { SessionEvent } from "../event"
 import { SessionHistory } from "../history"
 import { SessionInput } from "../input"
+import { SessionWorkControl } from "../work-control"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
 import { type RunError, Service } from "./index"
@@ -105,6 +106,7 @@ const layer = Layer.effect(
     const referenceGuidance = yield* ReferenceGuidance.Service
     const config = yield* Config.Service
     const snapshots = yield* Snapshot.Service
+    const workControl = yield* SessionWorkControl.Service
     const db = (yield* Database.Service).db
     const compaction = SessionCompaction.make({ events, llm, config: yield* config.entries() })
     const getSession = Effect.fn("SessionRunner.getSession")(function* (sessionID: SessionSchema.ID) {
@@ -174,8 +176,21 @@ const layer = Layer.effect(
       sessionID: SessionSchema.ID,
       promotion: SessionInput.Delivery | undefined,
       step: number,
+      work: SessionInput.Work,
       recoverOverflow?: typeof compaction.compactAfterOverflow,
     ) {
+      const cutoff = yield* EventV2.latestSequence(db, sessionID)
+      if (promotion && work.pending) {
+        work.pending.clear()
+        for (const id of yield* SessionInput.selected(
+          db,
+          sessionID,
+          promotion,
+          cutoff,
+          SessionInput.MAX_WORK_INPUTS - work.inputs.size,
+        ))
+          work.pending.add(id)
+      }
       const session = yield* getSession(sessionID)
       if (session.location.directory !== location.directory || session.location.workspaceID !== location.workspaceID)
         return yield* Effect.interrupt
@@ -185,12 +200,11 @@ const layer = Layer.effect(
       let needsContinuation = false
       let currentStep = step
       if (promotion) {
-        const cutoff = yield* EventV2.latestSequence(db, session.id)
         let promoted = 0
-        if (promotion === "steer") promoted = yield* SessionInput.promoteSteers(db, events, session.id, cutoff)
+        if (promotion === "steer") promoted = yield* SessionInput.promoteSteers(db, events, session.id, cutoff, work)
         if (promotion === "queue") {
-          promoted += Number(yield* SessionInput.promoteNextQueued(db, events, session.id))
-          promoted += yield* SessionInput.promoteSteers(db, events, session.id, cutoff)
+          promoted += Number(yield* SessionInput.promoteNextQueued(db, events, session.id, work))
+          promoted += yield* SessionInput.promoteSteers(db, events, session.id, cutoff, work)
         }
         if (promoted > 0) currentStep = 1
       }
@@ -233,6 +247,8 @@ const layer = Layer.effect(
           ...(session.model?.variant === undefined ? {} : { variant: session.model.variant }),
         },
         snapshot: startSnapshot,
+        workID: work.id,
+        inputMessageIDs: Array.from(work.inputs),
       })
       const withPublication = Semaphore.makeUnsafe(1).withPermit
       const publish = (event: LLMEvent, outputPaths: ReadonlyArray<string> = []) =>
@@ -323,6 +339,13 @@ const layer = Layer.effect(
             yield* withPublication(publisher.failUnsettledTools(`Tool execution failed: ${message}`))
           }
           const stepSettlement = publisher.stepSettlement()
+          if (
+            stream._tag === "Success" &&
+            !stepSettlement &&
+            !publisher.hasProviderError() &&
+            publisher.hasActiveAssistant()
+          )
+            yield* withPublication(publisher.failAssistant("Provider stream ended before completion"))
           if (stepSettlement && !publisher.hasProviderError()) {
             const endSnapshot = yield* snapshots.capture()
             const files =
@@ -351,7 +374,11 @@ const layer = Layer.effect(
           if (stream._tag === "Failure") return yield* Effect.failCause(stream.cause)
           if (settled._tag === "Failure" && Cause.hasInterrupts(settled.cause))
             return yield* Effect.failCause(settled.cause)
-          return { needsContinuation: !publisher.hasProviderError() && needsContinuation, step: currentStep }
+          return {
+            needsContinuation: !publisher.hasProviderError() && needsContinuation,
+            step: currentStep,
+            failed: publisher.hasProviderError() || stepSettlement === undefined,
+          }
         }),
       )
     }, Effect.scoped)
@@ -359,31 +386,35 @@ const layer = Layer.effect(
       sessionID: SessionSchema.ID,
       promotion: SessionInput.Delivery | undefined,
       step: number,
-    ) => Effect.Effect<{ readonly needsContinuation: boolean; readonly step: number }, RunError>
+      work: SessionInput.Work,
+    ) => Effect.Effect<
+      { readonly needsContinuation: boolean; readonly step: number; readonly failed: boolean },
+      RunError
+    >
 
-    const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step) {
-      return yield* runTurnAttempt(sessionID, promotion, step).pipe(
+    const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step, work) {
+      return yield* runTurnAttempt(sessionID, promotion, step, work).pipe(
         Effect.catchDefect(
           Effect.fnUntraced(function* (defect) {
             if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
             if (defect.transition._tag === "ContinueAfterOverflowCompaction")
               return yield* Effect.die("Post-compaction provider attempt cannot recover another overflow")
             yield* Effect.yieldNow
-            return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step)
+            return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step, work)
           }),
         ),
       )
     })
 
-    const runTurn: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step) {
-      return yield* runTurnAttempt(sessionID, promotion, step, compaction.compactAfterOverflow).pipe(
+    const runTurn: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step, work) {
+      return yield* runTurnAttempt(sessionID, promotion, step, work, compaction.compactAfterOverflow).pipe(
         Effect.catchDefect(
           Effect.fnUntraced(function* (defect) {
             if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
             yield* Effect.yieldNow
             if (defect.transition._tag === "ContinueAfterOverflowCompaction")
-              return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step)
-            return yield* runTurn(sessionID, undefined, defect.transition.step)
+              return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step, work)
+            return yield* runTurn(sessionID, undefined, defect.transition.step, work)
           }),
         ),
       )
@@ -400,17 +431,78 @@ const layer = Layer.effect(
       let promotion: SessionInput.Delivery | undefined = hasSteer ? "steer" : hasQueue ? "queue" : undefined
       let shouldRun = input.force || hasSteer || hasQueue
       while (shouldRun) {
-        let needsContinuation = true
-        let step = 1
-        while (needsContinuation) {
-          const result = yield* runTurn(input.sessionID, promotion, step)
-          needsContinuation = result.needsContinuation
-          step = result.step + 1
-          promotion = "steer"
-          if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
-        }
-        shouldRun = yield* SessionInput.hasPending(db, input.sessionID, "queue")
-        promotion = shouldRun ? "queue" : undefined
+        // A work boundary is semantic: all provider/tool continuations for these exact inputs.
+        // Coordinator drains can contain several works, and an orphaned work is never resumed implicitly.
+        const work: SessionInput.Work = { id: `work_${crypto.randomUUID()}`, inputs: new Set(), pending: new Set() }
+        let failed = false
+        yield* Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            yield* events.publish(SessionEvent.Work.Started, {
+              sessionID: input.sessionID,
+              timestamp: yield* DateTime.now,
+              workID: work.id,
+              inputMessageIDs: [],
+            })
+            yield* restore(
+              Effect.gen(function* () {
+                let needsContinuation = true
+                let step = 1
+                let first = true
+                while (needsContinuation) {
+                  if (!first && (yield* workControl.drain(input.sessionID, work)) > 0) step = 1
+                  first = false
+                  const result = yield* runTurn(input.sessionID, promotion, step, work)
+                  failed = result.failed
+                  if (failed) return
+                  needsContinuation = result.needsContinuation
+                  step = result.step + 1
+                  promotion = "steer"
+                  if (!needsContinuation && work.inputs.size < SessionInput.MAX_WORK_INPUTS)
+                    needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
+                  needsContinuation = yield* workControl.continue(input.sessionID, work, needsContinuation)
+                }
+              }),
+            ).pipe(
+              Effect.onExit((exit) =>
+                Effect.gen(function* () {
+                  yield* workControl.close(input.sessionID, work)
+                  // Rejected approvals/questions interrupt the work just like explicit cancellation.
+                  const outcome =
+                    exit._tag === "Failure" && Cause.hasInterrupts(exit.cause)
+                      ? "cancelled"
+                      : exit._tag === "Failure" || failed
+                        ? "failed"
+                        : "completed"
+                  yield* events.publish(SessionEvent.Work.Settled, {
+                    sessionID: input.sessionID,
+                    timestamp: yield* DateTime.now,
+                    workID: work.id,
+                    inputMessageIDs: Array.from(work.inputs),
+                    outcome,
+                    ...(work.pending?.size ? { pendingInputMessageIDs: Array.from(work.pending) } : {}),
+                    ...(outcome === "completed"
+                      ? {}
+                      : {
+                          error: {
+                            type: "unknown" as const,
+                            message:
+                              outcome === "cancelled"
+                                ? "Work cancelled"
+                                : work.pending?.size
+                                  ? "Work blocked before prompt promotion; retry explicitly"
+                                  : "Work failed",
+                          },
+                        }),
+                  })
+                }),
+              ),
+            )
+          }),
+        ).pipe((effect) => workControl.run(input.sessionID, work, effect))
+        const steers = yield* SessionInput.hasPending(db, input.sessionID, "steer")
+        const queued = steers ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
+        shouldRun = steers || queued
+        promotion = steers ? "steer" : queued ? "queue" : undefined
       }
     })
 
@@ -436,6 +528,7 @@ export const node = makeLocationNode({
     ReferenceGuidance.node,
     Config.node,
     Snapshot.node,
+    SessionWorkControl.node,
     Database.node,
   ],
 })

@@ -691,6 +691,194 @@ describe("OpenAI Responses route", () => {
     }),
   )
 
+  it.effect("preserves provider item identity and phases through text lifecycle and history lowering", () =>
+    Effect.gen(function* () {
+      const first = { type: "message", role: "assistant", id: "msg_comment", phase: "commentary" }
+      const last = { type: "message", role: "assistant", id: "msg_final", phase: "final_answer" }
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents(
+              { type: "response.output_item.added", item: first },
+              { type: "response.output_text.delta", item_id: first.id, delta: "Checking" },
+              {
+                type: "response.output_item.done",
+                item: { ...first, content: [{ type: "output_text", text: "Checking." }] },
+              },
+              {
+                type: "response.output_item.done",
+                item: { ...first, content: [{ type: "output_text", text: "Checking." }] },
+              },
+              { type: "response.output_item.added", item: last },
+              { type: "response.output_text.delta", item_id: last.id, delta: "Done" },
+              {
+                type: "response.output_item.done",
+                item: { ...last, content: [{ type: "output_text", text: "Done." }] },
+              },
+              { type: "response.completed", response: { id: "resp_phases" } },
+            ),
+          ),
+        ),
+      )
+      expect(response.events.filter((event) => event.type.startsWith("text-"))).toEqual([
+        { type: "text-start", id: first.id, providerMetadata: { openai: { itemId: first.id, phase: first.phase } } },
+        {
+          type: "text-delta",
+          id: first.id,
+          text: "Checking",
+          providerMetadata: { openai: { itemId: first.id, phase: first.phase } },
+        },
+        {
+          type: "text-end",
+          id: first.id,
+          text: "Checking.",
+          providerMetadata: { openai: { itemId: first.id, phase: first.phase } },
+        },
+        { type: "text-start", id: last.id, providerMetadata: { openai: { itemId: last.id, phase: last.phase } } },
+        {
+          type: "text-delta",
+          id: last.id,
+          text: "Done",
+          providerMetadata: { openai: { itemId: last.id, phase: last.phase } },
+        },
+        {
+          type: "text-end",
+          id: last.id,
+          text: "Done.",
+          providerMetadata: { openai: { itemId: last.id, phase: last.phase } },
+        },
+      ])
+      const prepared = yield* LLMClient.prepare(
+        LLM.request({ model, messages: [Message.assistant(response.message.content)] }),
+      )
+      expect(prepared.body).toMatchObject({
+        input: [
+          { role: "assistant", phase: "commentary", content: [{ type: "output_text", text: "Checking." }] },
+          { role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: "Done." }] },
+        ],
+      })
+    }),
+  )
+
+  for (const phase of [null, undefined, "future_phase"]) {
+    it.effect(`does not infer a phase from an unlabelled completed item (${phase})`, () =>
+      Effect.gen(function* () {
+        const response = yield* LLMClient.generate(request).pipe(
+          Effect.provide(
+            fixedResponse(
+              sseEvents(
+                {
+                  type: "response.output_item.done",
+                  item: {
+                    type: "message",
+                    role: "assistant",
+                    id: "msg_unknown",
+                    phase,
+                    content: [{ type: "output_text", text: "Unlabelled" }],
+                  },
+                },
+                { type: "response.completed", response: { id: "resp_unknown" } },
+              ),
+            ),
+          ),
+        )
+        expect(response.message.content).toEqual([
+          { type: "text", text: "Unlabelled", providerMetadata: { openai: { itemId: "msg_unknown" } } },
+        ])
+      }),
+    )
+  }
+
+  it.effect("retains known phase when the response ends without an output item done", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents(
+              {
+                type: "response.output_item.added",
+                item: { type: "message", role: "assistant", id: "msg_partial", phase: "commentary" },
+              },
+              { type: "response.output_text.delta", item_id: "msg_partial", delta: "Partial" },
+              { type: "response.incomplete", response: { incomplete_details: { reason: "max_output_tokens" } } },
+            ),
+          ),
+        ),
+      )
+      expect(response.message.content).toEqual([
+        { type: "text", text: "Partial", providerMetadata: { openai: { itemId: "msg_partial", phase: "commentary" } } },
+      ])
+    }),
+  )
+
+  it.effect("preserves assistant refusal text instead of settling an empty item", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents(
+              {
+                type: "response.output_item.added",
+                item: { type: "message", role: "assistant", id: "msg_refusal", phase: "final_answer" },
+              },
+              { type: "response.refusal.delta", item_id: "msg_refusal", delta: "I cannot" },
+              {
+                type: "response.output_item.done",
+                item: {
+                  type: "message",
+                  role: "assistant",
+                  id: "msg_refusal",
+                  phase: "final_answer",
+                  content: [{ type: "refusal", refusal: "I cannot help with that." }],
+                },
+              },
+              { type: "response.completed", response: { id: "resp_refusal" } },
+            ),
+          ),
+        ),
+      )
+      expect(response.text).toBe("I cannot help with that.")
+      expect(response.message.content).toEqual([
+        {
+          type: "text",
+          text: "I cannot help with that.",
+          providerMetadata: { openai: { itemId: "msg_refusal", phase: "final_answer" } },
+        },
+      ])
+    }),
+  )
+
+  it.effect("assembles a final-only refusal without inventing its phase", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents(
+              {
+                type: "response.output_item.done",
+                item: {
+                  type: "message",
+                  role: "assistant",
+                  id: "msg_refusal_only",
+                  content: [{ type: "refusal", refusal: "I cannot help with that." }],
+                },
+              },
+              { type: "response.completed", response: { id: "resp_refusal_only" } },
+            ),
+          ),
+        ),
+      )
+      expect(response.text).toBe("I cannot help with that.")
+      expect(response.message.content).toEqual([
+        {
+          type: "text",
+          text: "I cannot help with that.",
+          providerMetadata: { openai: { itemId: "msg_refusal_only" } },
+        },
+      ])
+    }),
+  )
+
   it.effect("parses text and usage stream fixtures", () =>
     Effect.gen(function* () {
       const body = sseEvents(

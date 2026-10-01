@@ -129,6 +129,7 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
             id: event.data.messageID,
             type: "user",
             metadata: event.metadata,
+            workID: event.data.workID,
             text: event.data.prompt.text,
             files: event.data.prompt.files,
             agents: event.data.prompt.agents,
@@ -137,6 +138,8 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
         )
       },
       "session.next.prompt.admitted": () => Effect.void,
+      "session.next.work.started": () => Effect.void,
+      "session.next.work.settled": () => Effect.void,
       "session.next.context.updated": (event) =>
         adapter.appendMessage(
           SessionMessage.System.make({
@@ -197,6 +200,8 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
             SessionMessage.Assistant.make({
               id: event.data.assistantMessageID,
               type: "assistant",
+              workID: event.data.workID,
+              inputMessageIDs: event.data.inputMessageIDs,
               agent: event.data.agent,
               model: event.data.model,
               time: { created: event.data.timestamp },
@@ -230,20 +235,33 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
       "session.next.text.started": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
           draft.content.push(
-            castDraft(SessionMessage.AssistantText.make({ type: "text", id: event.data.textID, text: "" })),
+            castDraft(
+              SessionMessage.AssistantText.make({
+                type: "text",
+                id: event.data.textID,
+                text: "",
+                providerMetadata: event.data.providerMetadata,
+              }),
+            ),
           )
         })
       },
       "session.next.text.delta": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
           const match = latestText(draft, event.data.textID)
-          if (match) match.text += event.data.delta
+          if (match) {
+            match.text += event.data.delta
+            if (event.data.providerMetadata !== undefined) match.providerMetadata = event.data.providerMetadata
+          }
         })
       },
       "session.next.text.ended": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
           const match = latestText(draft, event.data.textID)
-          if (match) match.text = event.data.text
+          if (match) {
+            match.text = event.data.text
+            if (event.data.providerMetadata !== undefined) match.providerMetadata = event.data.providerMetadata
+          }
         })
       },
       "session.next.tool.input.started": (event) => {
