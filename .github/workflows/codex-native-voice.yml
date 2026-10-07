@@ -2,7 +2,7 @@ name: codex-native-voice
 
 on:
   push:
-    branches: [codex-native-voice]
+    branches: [codex-native-voice, carry/native-voice, integration]
   pull_request:
     paths:
       - "packages/core/**"
